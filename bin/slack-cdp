@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+// Command line for slack-cdp: tail, send, history, search, api, workspaces, doctor, mcp.
+import { parseArgs } from "node:util";
+import { connect, doctor, mentions, plainText, serveMcp } from "../index.js";
+import pkg from "../package.json" with { type: "json" };
+
+const HELP = `slack-cdp ${pkg.version}: Slack as you, through the desktop app's session
+
+usage: slack-cdp <command> [options]
+
+  doctor                       check the app, port, page, session and API, and say what broke
+  workspaces                   list signed-in workspaces
+  tail                         print new messages live
+      -o, --org NAME           only this workspace (name prefix or ID); repeat for more
+      -c, --channel NAME       only this channel (#name, @person, or ID); repeat for more
+      -m, --mentions           only messages mentioning you, and your DMs and group DMs
+  send <channel> [text]        post a message (text from stdin if omitted)
+      -t, --thread TS          reply in this thread
+  history <channel>            print recent messages, oldest first
+      -n, --limit N            how many (default 20)
+      -t, --thread TS          that thread's replies instead
+  search <query>               search messages with Slack search syntax
+  api <method> [key=value...]  call any Web API method, print the response
+  mcp                          run the MCP server on stdio
+
+  <channel> is an ID, #name, or @person (their DM).
+  -o, --org NAME               workspace for send, history, search and api
+  --json                       JSON output (tail: one message per line)
+  --port N                     DevTools port (default 9222)
+  --launch                     restart Slack with the port if it isn't open; restored on exit
+
+While Slack's DevTools port is open, any local process can take over your Slack session.`;
+
+const { values: opts, positionals } = parseArgs({
+  allowPositionals: true,
+  options: {
+    org: { type: "string", short: "o", multiple: true },
+    channel: { type: "string", short: "c", multiple: true },
+    mentions: { type: "boolean", short: "m" },
+    thread: { type: "string", short: "t" },
+    limit: { type: "string", short: "n" },
+    json: { type: "boolean" },
+    port: { type: "string" },
+    launch: { type: "boolean" },
+    help: { type: "boolean", short: "h" },
+    version: { type: "boolean", short: "v" },
+  },
+});
+
+const [command, ...args] = positionals;
+const port = opts.port ? Number(opts.port) : 9222;
+const team = opts.org?.[0] ?? null;
+const color = process.stdout.isTTY && !process.env.NO_COLOR && !opts.json;
+const paint = (code) => (s) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
+const [dim, bold, cyan, yellow, red, green] = [2, 1, 36, 33, 31, 32].map(paint);
+const clock = (ts) => new Date(Number(ts) * 1000).toTimeString().slice(0, 8);
+const status = (msg) => console.error(dim(msg));
+const fail = (msg) => {
+  console.error(msg);
+  process.exit(1);
+};
+const print = (x) => console.log(opts.json ? JSON.stringify(x, null, 2) : x);
+
+async function readStdin() {
+  let text = "";
+  for await (const chunk of process.stdin) text += chunk;
+  return text.trimEnd();
+}
+
+// Exits cleanly on Ctrl+C, restoring Slack if this launched it.
+async function open() {
+  const slack = await connect({ port, launch: opts.launch });
+  const quit = () => slack.close().finally(() => process.exit(0));
+  process.once("SIGINT", quit);
+  process.once("SIGTERM", quit);
+  return slack;
+}
+
+async function readable(slack, m, team) {
+  const names = new Map(await Promise.all(mentions(m.text).map(async (id) => [id, await slack.userName(id, { team })])));
+  let text = plainText(m.text, (id) => names.get(id) ?? id);
+  if (m.files?.length) text += `${text ? " " : ""}${dim(`[${m.files.join(", ")}]`)}`;
+  return text.split("\n").join("\n    ");
+}
+
+const commands = {
+  async doctor() {
+    const { ok, checks } = await doctor({ port });
+    if (opts.json) return print({ ok, checks });
+    const mark = { ok: green("ok  "), warn: yellow("warn"), fail: red("fail") };
+    for (const c of checks) console.log(`${mark[c.status]} ${bold(c.name)}: ${c.detail}${c.hint ? `\n     ${dim(c.hint)}` : ""}`);
+    process.exitCode = ok ? 0 : 1;
+  },
+
+  async workspaces() {
+    const slack = await open();
+    const ws = await slack.workspaces();
+    print(opts.json ? ws : ws.map((w) => `${w.id}  ${w.name}  you: ${w.userId}${w.active ? "  (active)" : ""}`).join("\n"));
+    await slack.close();
+  },
+
+  async tail() {
+    const slack = await open();
+    const all = await slack.workspaces();
+    const matches = (w, o) => w.id === o || w.name.toLowerCase().startsWith(o.toLowerCase());
+    const unknown = (opts.org ?? []).filter((o) => !all.some((w) => matches(w, o)));
+    if (unknown.length) fail(`no workspace matches ${unknown.join(", ")}; signed in to ${all.map((w) => w.name).join(", ")}`);
+    const ws = opts.org ? all.filter((w) => opts.org.some((o) => matches(w, o))) : all;
+    const teams = new Map(ws.map((w) => [w.id, w.name]));
+    const bare = (s) => s.replace(/^#/, "").toLowerCase();
+    const channels = new Set((opts.channel ?? []).map(bare));
+
+    async function wanted(m) {
+      if (channels.size && !channels.has(bare(m.channel)) && !channels.has(bare(await slack.place(m.channel, { team: m.team })))) return false;
+      if (opts.mentions && !mentions(m.text).some((id) => slack.isSelf(id))) {
+        const c = await slack.conversationInfo(m.channel, { team: m.team }).catch(() => null);
+        if (!c?.im && !c?.mpim) return false;
+      }
+      return true;
+    }
+
+    async function line(m) {
+      const opt = { team: m.team };
+      const [place, who] = await Promise.all([slack.place(m.channel, opt), slack.userName(m.user, opt)]);
+      if (opts.json) return JSON.stringify({ ...m, workspace: teams.get(m.team) ?? null, place, name: who });
+      const thread = m.threadTs && m.threadTs !== m.ts ? yellow(" ↳") : "";
+      return `${dim(clock(m.ts))} ${cyan(`${teams.get(m.team) ?? m.team} ${place}`)}${thread} ${bold(who)}: ${await readable(slack, m, m.team)}`;
+    }
+
+    slack.on("disconnect", () => status("lost the Slack page, reconnecting"));
+    slack.on("connect", () => status("reconnected"));
+    const only = [channels.size && [...channels].join(", "), opts.mentions && "mentions and DMs"].filter(Boolean);
+    status(`tailing ${ws.map((w) => w.name).join(" and ")}${only.length ? `, only ${only.join("; ")}` : ""}. Ctrl+C stops`);
+
+    // Lines print in arrival order even though lookups take a moment.
+    let printing = Promise.resolve();
+    for await (const m of slack.messages()) {
+      if (opts.org && !teams.has(m.team)) continue;
+      const out = wanted(m)
+        .then((yes) => (yes ? line(m) : null))
+        .catch((e) => `${clock(m.ts)} ${m.channel} ${m.user}: ${m.text} ${dim(`(${e.message})`)}`);
+      printing = printing.then(async () => {
+        const l = await out;
+        if (l) console.log(l);
+      });
+    }
+  },
+
+  async send() {
+    const [channel, ...words] = args;
+    if (!channel) fail("usage: slack-cdp send <channel> [text]");
+    const text = words.length ? words.join(" ") : await readStdin();
+    if (!text) fail("nothing to send");
+    const slack = await open();
+    const ts = await slack.postMessage(channel, text, { threadTs: opts.thread, team });
+    print(opts.json ? { ts } : `sent at ${ts}`);
+    await slack.close();
+  },
+
+  async history() {
+    const [channel] = args;
+    if (!channel) fail("usage: slack-cdp history <channel>");
+    const slack = await open();
+    const messages = (await slack.history(channel, { limit: Number(opts.limit ?? 20), threadTs: opts.thread, team })).reverse();
+    if (opts.json) print(messages);
+    else {
+      for (const m of messages) {
+        const who = m.self ? "me" : await slack.userName(m.user, { team });
+        const thread = m.threadTs && m.threadTs !== m.ts ? yellow(" ↳") : m.replies ? dim(` (${m.replies} replies)`) : "";
+        console.log(`${dim(`${clock(m.ts)} ${m.ts}`)}${thread} ${bold(who)}: ${await readable(slack, m, team)}`);
+      }
+    }
+    await slack.close();
+  },
+
+  async search() {
+    const query = args.join(" ");
+    if (!query) fail("usage: slack-cdp search <query>");
+    const slack = await open();
+    const hits = await slack.search(query, { team, count: Number(opts.limit ?? 20) });
+    if (opts.json) print(hits);
+    else for (const h of hits) console.log(`${cyan(`#${h.channelName ?? h.channel}`)} ${dim(h.ts)} ${bold(h.username ?? h.user)}: ${h.text}`);
+    await slack.close();
+  },
+
+  async api() {
+    const [method, ...pairs] = args;
+    if (!method) fail("usage: slack-cdp api <method> [key=value...]");
+    const params = Object.fromEntries(
+      pairs.map((p) => {
+        const i = p.indexOf("=");
+        if (i < 1) fail(`expected key=value, got ${p}`);
+        return [p.slice(0, i), p.slice(i + 1)];
+      }),
+    );
+    const slack = await open();
+    try {
+      console.log(JSON.stringify(await slack.api(method, params, { team }), null, 2));
+    } catch (e) {
+      console.error(e.body ? JSON.stringify(e.body, null, 2) : e.message);
+      process.exitCode = 1;
+    }
+    await slack.close();
+  },
+
+  async mcp() {
+    const server = serveMcp({ connectOptions: { port, launch: opts.launch } });
+    process.once("SIGINT", server.stop);
+    process.once("SIGTERM", server.stop);
+    await server.done;
+    process.exit(0);
+  },
+};
+
+if (opts.version) console.log(pkg.version);
+else if (opts.help || !command) console.log(HELP);
+else if (!commands[command]) fail(`unknown command ${command}\n\n${HELP}`);
+else await commands[command]().catch((e) => fail(e.message));
