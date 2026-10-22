@@ -1,0 +1,21 @@
+{
+  "name": "slack-cdp",
+  "version": "0.1.0",
+  "description": "Script Slack as yourself through the desktop app's own session, over the DevTools protocol",
+  "type": "module",
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.js" },
+    "./package.json": "./package.json"
+  },
+  "types": "./index.d.ts",
+  "bin": { "slack-cdp": "bin/slack-cdp" },
+  "files": ["index.js", "index.d.ts", "src", "bin"],
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test" },
+  "keywords": ["slack", "cdp", "devtools", "electron", "mcp", "automation"],
+  "repository": { "type": "git", "url": "git+https://github.com/kinduff/slack-cdp.git" },
+  "homepage": "https://github.com/kinduff/slack-cdp#readme",
+  "bugs": "https://github.com/kinduff/slack-cdp/issues",
+  "author": "kinduff",
+  "license": "MIT"
+}
